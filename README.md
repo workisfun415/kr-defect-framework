@@ -1,3 +1,13 @@
+@software
+{pasupuleti2026kr_code,
+  author    = {Pasupuleti, RamaKrishna},
+  title     = {K-R Defect Framework: Python Library and Benchmarks},
+  version   = {v1.0.1},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.21339639},
+  url       = {https://doi.org/10.5281/zenodo.21339639}
+}
 # K-R Defect Framework — Python Library
 
 Based on the published paper:
