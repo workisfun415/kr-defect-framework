@@ -1,0 +1,238 @@
+"""
+utils.py — Analysis utilities for the K–R framework.
+
+Provides:
+- convergence_order()  : measure p where error ~ O(h^p)
+- monte_carlo_error()  : noise robustness via MC simulation
+- compare_methods()    : K–R vs FD comparison at a point
+"""
+
+import numpy as np
+from typing import Callable, Optional
+from .core import KRHessian
+
+
+def convergence_order(
+    f: Callable,
+    x: np.ndarray,
+    H_true: np.ndarray,
+    steps: Optional[np.ndarray] = None,
+    n_kvals: int = 9,
+    entry: tuple = (0, 0),
+) -> dict:
+    """
+    Measure the empirical convergence order of K–R Hessian recovery.
+
+    Computes the error |H_KR[i,j] - H_true[i,j]| at several step sizes
+    and fits the slope p in error ~ C·h^p.
+
+    Parameters
+    ----------
+    f : callable
+    x : np.ndarray — evaluation point
+    H_true : np.ndarray — true Hessian at x
+    steps : np.ndarray, optional — step sizes (default log-spaced 0.01–0.3)
+    n_kvals : int — K-value averaging count
+    entry : tuple (i,j) — which Hessian entry to monitor
+
+    Returns
+    -------
+    dict with:
+        'steps'  : np.ndarray
+        'errors' : np.ndarray
+        'order'  : float  — estimated convergence order p
+        'method' : str    — 'K-R'
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from kr_defect.utils import convergence_order
+    >>> f = lambda x: np.exp(x[0]+x[1])
+    >>> H_true = np.exp(1.0) * np.ones((2,2))
+    >>> r = convergence_order(f, np.array([0.5,0.5]), H_true)
+    >>> print(f"K-R convergence order: {r['order']:.3f}")  # ≈ 1.0
+    """
+    if steps is None:
+        steps = np.array([0.30, 0.20, 0.10, 0.05, 0.025, 0.013])
+
+    i, j = entry
+    errors = np.zeros(len(steps))
+
+    for k, s in enumerate(steps):
+        kr = KRHessian(f, step=s, n_kvals=n_kvals)
+        H_est = kr.compute(x)
+        errors[k] = abs(H_est[i, j] - H_true[i, j])
+
+    # Fit log-log slope
+    valid = errors > 1e-15
+    if valid.sum() >= 2:
+        log_h = np.log(steps[valid])
+        log_e = np.log(errors[valid])
+        p, _ = np.polyfit(log_h, log_e, 1)
+    else:
+        p = float('nan')
+
+    return {
+        'steps'  : steps,
+        'errors' : errors,
+        'order'  : float(p),
+        'method' : 'K-R',
+    }
+
+
+def monte_carlo_error(
+    f: Callable,
+    x: np.ndarray,
+    H_true: np.ndarray,
+    sigma: float = 1e-3,
+    n_trials: int = 1000,
+    step: float = 0.05,
+    n_kvals: int = 9,
+    noise_type: str = 'gaussian',
+    seed: int = 42,
+) -> dict:
+    """
+    Monte Carlo noise robustness experiment.
+
+    Adds measurement noise to f and measures the resulting Hessian error
+    over n_trials independent trials.
+
+    Parameters
+    ----------
+    f : callable — true (noiseless) function
+    x : np.ndarray — evaluation point
+    H_true : np.ndarray — true Hessian at x
+    sigma : float — noise standard deviation
+    n_trials : int — number of trials
+    step : float — K–R step size
+    n_kvals : int — K-value count
+    noise_type : str — 'gaussian', 'impulsive', or 'correlated'
+    seed : int — random seed
+
+    Returns
+    -------
+    dict with:
+        'mean'     : float — mean RMSE across trials
+        'std'      : float — std dev of RMSE
+        'ci_95'    : tuple — 95% confidence interval (lo, hi)
+        'n_trials' : int
+        'sigma'    : float
+        'noise_type': str
+        'errors'   : np.ndarray — per-trial RMSE
+    """
+    rng = np.random.default_rng(seed)
+    errors = np.zeros(n_trials)
+    _eval_count = [0]
+
+    for trial in range(n_trials):
+        # Create noisy function
+        if noise_type == 'gaussian':
+            cache = {}
+            def f_noisy(pt):
+                key = tuple(np.round(pt, 12))
+                if key not in cache:
+                    cache[key] = float(f(np.asarray(pt))) + rng.normal(0, sigma)
+                return cache[key]
+
+        elif noise_type == 'impulsive':
+            cache = {}
+            def f_noisy(pt):
+                key = tuple(np.round(pt, 12))
+                if key not in cache:
+                    val = float(f(np.asarray(pt)))
+                    if rng.random() < 0.10:  # 10% outlier
+                        val += rng.normal(0, 10 * sigma)
+                    else:
+                        val += rng.normal(0, sigma)
+                    cache[key] = val
+                return cache[key]
+
+        elif noise_type == 'correlated':
+            base_noise = rng.normal(0, sigma)
+            cache = {}
+            def f_noisy(pt):
+                key = tuple(np.round(pt, 12))
+                if key not in cache:
+                    cache[key] = (float(f(np.asarray(pt)))
+                                  + base_noise
+                                  + rng.normal(0, sigma * 0.1))
+                return cache[key]
+        else:
+            raise ValueError(f"Unknown noise_type: {noise_type}")
+
+        kr  = KRHessian(f_noisy, step=step, n_kvals=n_kvals)
+        H   = kr.compute(x)
+        errors[trial] = float(np.sqrt(np.mean((H - H_true) ** 2)))
+
+    mean_e = float(np.mean(errors))
+    std_e  = float(np.std(errors))
+    se     = std_e / np.sqrt(n_trials)
+    ci_lo  = mean_e - 1.96 * se
+    ci_hi  = mean_e + 1.96 * se
+
+    return {
+        'mean'      : mean_e,
+        'std'       : std_e,
+        'ci_95'     : (ci_lo, ci_hi),
+        'n_trials'  : n_trials,
+        'sigma'     : sigma,
+        'noise_type': noise_type,
+        'errors'    : errors,
+    }
+
+
+def compare_methods(
+    f: Callable,
+    x: np.ndarray,
+    H_true: np.ndarray,
+    step: float = 0.05,
+    n_kvals: int = 9,
+) -> dict:
+    """
+    Compare K–R and central FD at a single point.
+
+    Returns RMSE, per-entry errors, and whether central FD
+    could theoretically be applied (always True for an interior point,
+    but False near boundaries where x-h ∉ Ω).
+
+    Parameters
+    ----------
+    f : callable
+    x : np.ndarray
+    H_true : np.ndarray
+    step : float
+    n_kvals : int
+
+    Returns
+    -------
+    dict with keys 'kr', 'cfd' each containing:
+        'H'    : estimated Hessian
+        'rmse' : overall RMSE
+        'evals': function evaluations used
+    """
+    n = len(x)
+    # K–R
+    kr   = KRHessian(f, step=step, n_kvals=n_kvals)
+    H_kr = kr.compute(x)
+    rmse_kr = float(np.sqrt(np.mean((H_kr - H_true)**2)))
+
+    # Central FD
+    H_fd = np.zeros((n, n))
+    for i in range(n):
+        ei = np.zeros(n); ei[i] = 1.0
+        H_fd[i,i] = (f(x+step*ei) - 2*f(x) + f(x-step*ei)) / step**2
+    for i in range(n):
+        for j in range(i+1, n):
+            ei = np.zeros(n); ei[i] = 1.0
+            ej = np.zeros(n); ej[j] = 1.0
+            v = (f(x+step*ei+step*ej) - f(x+step*ei-step*ej)
+                 - f(x-step*ei+step*ej) + f(x-step*ei-step*ej)) / (4*step**2)
+            H_fd[i,j] = v; H_fd[j,i] = v
+    rmse_fd = float(np.sqrt(np.mean((H_fd - H_true)**2)))
+
+    return {
+        'kr'  : {'H': H_kr, 'rmse': rmse_kr,
+                 'evals': 3 * n_kvals * n*(n+1)//2},
+        'cfd' : {'H': H_fd, 'rmse': rmse_fd,
+                 'evals': n*(n+1)//2 * 4 + n},  # approx
+    }
